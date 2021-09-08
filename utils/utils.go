@@ -2,12 +2,17 @@ package utils
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/mail"
 	"os"
 
+	"github.com/golang-jwt/jwt"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	// "zuri.chat/zccore/auth"/
 )
 
 // ErrorResponse : This is error model.
@@ -21,6 +26,17 @@ type SuccessResponse struct {
 	StatusCode int         `json:"status"`
 	Message    string      `json:"message"`
 	Data       interface{} `json:"data"`
+}
+
+type AuthUser struct {
+	ID    primitive.ObjectID
+	Email string
+}
+
+type MyCustomClaims struct {
+	Authorized bool
+	User       AuthUser
+	jwt.StandardClaims
 }
 
 // GetError : This is helper function to prepare error model.
@@ -91,4 +107,41 @@ func ParseJsonFromRequest(r *http.Request, v interface{}) error {
 func IsValidEmail(email string) bool {
 	_, err := mail.ParseAddress(email)
 	return err == nil
+}
+
+func TokenIsValid(utoken string) (bool, string, error) {
+
+	SECRET_KEY, _ := os.LookupEnv("AUTH_SECRET_KEY")
+	var cclaims MyCustomClaims
+
+	token, err := jwt.ParseWithClaims(utoken, &cclaims, func(token *jwt.Token) (interface{}, error) {
+		return []byte(SECRET_KEY), nil
+	})
+
+	if _, ok := token.Claims.(*MyCustomClaims); ok && token.Valid {
+		var iid interface{} = cclaims.User.ID
+		return true, iid.(primitive.ObjectID).Hex(), nil
+	} else {
+		fmt.Print(err)
+		return false, "Not Authorized", errors.New("Not Authorized.")
+	}
+
+}
+
+func TokenAgainstUserId(utoken string, user_id string) (bool, string, error) {
+	SECRET_KEY, _ := os.LookupEnv("AUTH_SECRET_KEY")
+	var cclaims MyCustomClaims
+
+	token, err := jwt.ParseWithClaims(utoken, &cclaims, func(token *jwt.Token) (interface{}, error) {
+		return []byte(SECRET_KEY), nil
+	})
+	var iiid string
+	if _, ok := token.Claims.(*MyCustomClaims); ok && token.Valid {
+		var iid interface{} = cclaims.User.ID
+		iiid = iid.(primitive.ObjectID).Hex()
+		return true, iiid, nil
+	} else {
+		fmt.Print(err)
+		return false, "Not Authorized", errors.New("Not Authorized.")
+	}
 }
