@@ -5,14 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/mitchellh/mapstructure"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"zuri.chat/zccore/auth"
+	"zuri.chat/zccore/user"
 	"zuri.chat/zccore/utils"
 )
 
+// Get an organization record
 func GetOrganization(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	collection := "organizations"
@@ -25,20 +30,74 @@ func GetOrganization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	save, err := utils.GetMongoDbDocs(collection, bson.M{"_id": objId})
+	save, _ := utils.GetMongoDbDoc(collection, bson.M{"_id": objId})
+
+	if save == nil {
+		utils.GetError(fmt.Errorf("organization %s not found", orgId), http.StatusNotFound, w)
+		return
+	}
+
+	orgPluginsMap, err := OrganizationPlugins(orgId)
+	if err != nil {
+		// org plugins not found.
+		utils.GetError(err, http.StatusNotFound, w)
+		return
+	}
+
+	var org Organization
+	
+	orgJson, _ := json.Marshal(save)
+	json.Unmarshal(orgJson, &org)
+
+	org.Plugins = orgPluginsMap
+
+	utils.GetSuccess("organization retrieved successfully", org, w)
+}
+
+// Get an organization by url
+func GetOrganizationByURL(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	orgURL := mux.Vars(r)["url"]
+
+	data, err := utils.GetMongoDbDoc("organizations", bson.M{"workspace_url": orgURL})
+	if data == nil {
+		fmt.Printf("workspace with url %s doesn't exist!", orgURL)
+		utils.GetError(errors.New("organization does not exist"), http.StatusNotFound, w)
+		return
+	}
 
 	if err != nil {
 		utils.GetError(err, http.StatusInternalServerError, w)
 		return
 	}
-	utils.GetSuccess("organization retrieved successfully", save, w)
+	
+	orgId := data["_id"].(string)
+
+	orgPluginsMap, err := OrganizationPlugins(orgId)
+	if err != nil {
+		// org plugins not found.
+		utils.GetError(err, http.StatusNotFound, w)
+		return
+	}
+
+	var org Organization
+	
+	orgJson, _ := json.Marshal(data)
+	json.Unmarshal(orgJson, &org)
+
+	org.Plugins = orgPluginsMap
+
+	utils.GetSuccess("organization retrieved successfully", org, w)
 }
 
+// Create an organization record
 func Create(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	// loggedIn := r.Context().Value("user").(*auth.AuthUser)
+	// loggedInUser, _ := auth.FetchUserByEmail(bson.M{"email": strings.ToLower(loggedIn.Email)})
 
 	var newOrg Organization
-	collection, user_collection := "organizations", "users"
+	collection, user_collection, member_collection := "organizations", "users", "members"
 
 	// Try to decode the request body into the struct. If there is an error,
 	// respond to the client with the error message and a 400 status code.
@@ -54,27 +113,26 @@ func Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// set default name if name is empty
-	if newOrg.Name == "" {
-		newOrg.Name = "ZuriWorkspace"
-	}
+	// generate workspace url
+	newOrg.Name = "Zuri Chat"
+	newOrg.WorkspaceURL = utils.GenWorkspaceUrl(newOrg.Name)
 
-	// confirm if user_id exists
-	objId, err := primitive.ObjectIDFromHex(newOrg.CreatorID)
+	// creator
+	creator, _ := auth.FetchUserByEmail(bson.M{"email": strings.ToLower(newOrg.CreatorEmail)})
+	var creatorid interface{} = creator.ID
+	var ccreatorid string = creatorid.(primitive.ObjectID).Hex()
 
-	if err != nil {
-		utils.GetError(errors.New("invalid id"), http.StatusBadRequest, w)
+	// extract user document
+	// var luHexid, _ = primitive.ObjectIDFromHex(loggedInUser.ID.Hex())
+
+	userDoc, _ := utils.GetMongoDbDoc(user_collection, bson.M{"email": newOrg.CreatorEmail})
+	if userDoc == nil {
+		fmt.Printf("user with email %s does not exist!", newOrg.CreatorEmail)
+		utils.GetError(errors.New("user with this email does not exist!"), http.StatusBadRequest, w)
 		return
 	}
 
-	user, _ := utils.GetMongoDbDoc(user_collection, bson.M{"_id": objId})
-	if user == nil {
-		fmt.Printf("users with id %s exists!", newOrg.CreatorID)
-		utils.GetError(errors.New("operation failed"), http.StatusBadRequest, w)
-		return
-	}
-
-	newOrg.WorkspaceURL = newOrg.Name + ".zuri.chat"
+	newOrg.CreatorID = ccreatorid
 	newOrg.CreatedAt = time.Now()
 
 	// convert to map object
@@ -89,10 +147,48 @@ func Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Todo: update user workspace and include the newly generated Id/workspace url
+	var iid interface{} = save.InsertedID
+	var iiid string = iid.(primitive.ObjectID).Hex()
+	hexOrgid, _ := primitive.ObjectIDFromHex(iiid)
+
+	// Adding user as a member
+	var user user.User
+	mapstructure.Decode(userDoc, &user)
+
+	newMember := Member{
+		Email:    user.Email,
+		OrgId:    hexOrgid.Hex(),
+		Role:     "owner",
+		Presence: "true",
+	}
+	// conv to struct
+	memStruc, err := utils.StructToMap(newMember)
+	if err != nil {
+		utils.GetError(err, http.StatusInternalServerError, w)
+		return
+	}
+
+	// add new member to member collection
+	_, e := utils.CreateMongoDbDoc(member_collection, memStruc)
+	if e != nil {
+		utils.GetError(err, http.StatusInternalServerError, w)
+		return
+	}
+
+	// add organisation id to user organisations list
+	updateFields := make(map[string]interface{})
+	user.Organizations = append(user.Organizations, iiid)
+	updateFields["Organizations"] = user.Organizations
+	_, ee := utils.UpdateOneMongoDbDoc(user_collection, ccreatorid, updateFields)
+	if ee != nil {
+		utils.GetError(errors.New("user update failed"), http.StatusInternalServerError, w)
+		return
+	}
+
 	utils.GetSuccess("organization created", save, w)
 }
 
+// Get all organization records
 func GetOrganizations(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
@@ -104,9 +200,10 @@ func GetOrganizations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	utils.GetSuccess("organization retrieved successfully", save, w)
+	utils.GetSuccess("organizations retrieved successfully", save, w)
 }
 
+// Delete an organization record
 func DeleteOrganization(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	orgId := mux.Vars(r)["id"]
@@ -128,6 +225,7 @@ func DeleteOrganization(w http.ResponseWriter, r *http.Request) {
 	utils.GetSuccess("organization deleted successfully", nil, w)
 }
 
+// Update an organization workspace url
 func UpdateUrl(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	orgId := mux.Vars(r)["id"]
@@ -152,9 +250,9 @@ func UpdateUrl(w http.ResponseWriter, r *http.Request) {
 	}
 
 	utils.GetSuccess("organization url updated successfully", nil, w)
-
 }
 
+// Update organization name
 func UpdateName(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	orgId := mux.Vars(r)["id"]
@@ -184,6 +282,7 @@ func UpdateName(w http.ResponseWriter, r *http.Request) {
 	utils.GetSuccess("organization name updated successfully", nil, w)
 }
 
+// Update organization logo
 func UpdateLogo(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
@@ -199,7 +298,7 @@ func UpdateLogo(w http.ResponseWriter, r *http.Request) {
 
 	org_filter := make(map[string]interface{})
 	org_filter["logo_url"] = requestData["organization_logo"]
-	
+
 	update, err := utils.UpdateOneMongoDbDoc(collection, orgId, org_filter)
 	if err != nil {
 		utils.GetError(err, http.StatusInternalServerError, w)
@@ -210,6 +309,6 @@ func UpdateLogo(w http.ResponseWriter, r *http.Request) {
 		utils.GetError(errors.New("operation failed"), http.StatusInternalServerError, w)
 		return
 	}
-	
+
 	utils.GetSuccess("organization logo updated successfully", nil, w)
 }
